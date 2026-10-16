@@ -1,11 +1,20 @@
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
-// Usa la direccion del escaner (0x27 o 0x3F). Para 16x2 cambia a lcd(0x27,16,2)
-LiquidCrystal_I2C lcd(0x27, 20, 4);
 void setup() {
-  lcd.init();
-  lcd.backlight();
-  lcd.setCursor(0, 0); lcd.print("Invernadero OK");
-  lcd.setCursor(0, 1); lcd.print("LCD funcionando");
+  Serial.begin(9600);
+  Wire.begin();
+  Serial.println("Escaneando bus I2C...");
 }
-void loop() {}
+void loop() {
+  byte count = 0;
+  for (byte a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("Dispositivo encontrado en 0x");
+      Serial.println(a, HEX);
+      count++;
+    }
+  }
+  if (count == 0) Serial.println("Ninguno (revisa cableado y pull-ups)");
+  Serial.println("----");
+  delay(3000);
+}

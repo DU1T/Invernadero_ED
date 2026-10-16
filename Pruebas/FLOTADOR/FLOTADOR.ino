@@ -1,4 +1,4 @@
-#define PIN_FLOTADOR 4   // en el diseno final del Mega ira en A1
+#define PIN_FLOTADOR A1   // en el diseno final del Mega ira en A1
 void setup() {
   Serial.begin(9600);
   pinMode(PIN_FLOTADOR, INPUT_PULLUP);
