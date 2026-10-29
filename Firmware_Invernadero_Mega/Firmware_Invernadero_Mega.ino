@@ -1,11 +1,27 @@
 /* ============================================================
    INVERNADERO INTELIGENTE - FIRMWARE v3 (Arduino Mega 2560)
    v3 (2026-10-25): v2 + control de acceso con RFID RC522 (ver seccion RFID).
+   v3-acidez (2026-10-28): version de DEMO para el 7-en-1 BL-TR5 (ver abajo).
    Sensores + logica + LCD + JSON al ESP32 + comandos con id/ACK
 
    Base: version del 2026-10-03 (la que mejor funciono). Se conservan
-   pines, calibraciones (UMBRAL_LUZ 100, MQ135 180, MQ7 270, riego 30/60,
-   pH 6.0-7.5), mapa del 7-en-1 y pantallas de la LCD.
+   pines, calibraciones (UMBRAL_LUZ 100, MQ135 180, MQ7 270, riego 30/60),
+   mapa del 7-en-1 y pantallas de la LCD.
+
+   --- CAMBIOS v3-acidez (28 oct) -------------------------------------
+   El electrodo de pH del 7-en-1 no entrega valor: reg3 siempre es 0
+   (confirmado con vinagre, agua, bicarbonato y tierra). El registro
+   0x0007 SI reacciona a la acidez (tierra/agua = 62-64, vinagre = 40,
+   no depende de la EC) pero NO esta calibrado ni responde a lo alcalino.
+     1. Se leen 8 registros (0x0000-0x0007) en vez de 7.
+     2. El campo "ph" del JSON ahora lleva reg7 / 10.
+        ES UN INDICADOR APROXIMADO SIN CALIBRAR, NO ES pH REAL.
+        La web debe rotularlo "pH aprox. (sin calibrar)". El contrato
+        JSON y las tablas NO cambian.
+     3. La aptitud del suelo ya no depende solo del pH: es la PEOR de
+        tres senales (EC, humedad de suelo, indicador de acidez).
+        Umbrales de demo, pendientes del cultivo real (Q-15).
+   ---------------------------------------------------------------------
 
    Cambios v2 (2026-10-20), ajustes 1-5 acordados con software:
      1. Protecciones SIEMPRE, tambien en manual:
@@ -102,10 +118,17 @@
 #define HIST_GAS         20    // crudo : la alarma apaga 20 puntos abajo del umbral
 #define GAS_MIN_ON_MS    10000UL  // alarma encendida al menos 10 s
 #define GAS_PRECAL_MS    60000UL  // ignora los MQ el primer minuto (precalentamiento)
-#define PH_APTO_MIN      6.0
-#define PH_APTO_MAX      7.5
-#define PH_REG_MIN       5.5
-#define PH_REG_MAX       8.0
+
+// Aptitud del suelo (DEMO): la peor de tres senales. Umbrales provisionales (Q-15).
+#define EC_APTO_MIN      100   // uS/cm : por debajo = NO_APTO (agua pura / vinagre / sonda al aire)
+#define EC_APTO_MAX      2500  // uS/cm : por encima = REGULAR
+#define EC_REG_MAX       4000  // uS/cm : por encima = NO_APTO (salinidad alta)
+#define HUM_APTO_MIN     20    // % humedad de suelo
+#define HUM_APTO_MAX     80
+#define HUM_REG_MIN      10    // fuera de 10-90 = NO_APTO
+#define HUM_REG_MAX      90
+#define ACID_APTO_MIN    5.5   // indicador reg7/10 (SIN CALIBRAR): >= APTO
+#define ACID_REG_MIN     4.5   // indicador reg7/10: >= REGULAR, por debajo NO_APTO
 
 #define TTL_DEFAULT_S    600
 #define ACK_CON_CMD      1     // 1 = el ACK ok lleva "cmd" (pedido de Wilson, 20 oct). 0 = ACK sin cmd
@@ -151,6 +174,7 @@ Servo servoVentana, servoPuerta;
 #if USA_7EN1
   #define SUELO_ADDR      2      // direccion Modbus del 7-en-1 (confirmada)
   #define SUELO_TIMEOUT_MS 250   // espera maxima de respuesta (bloquea como mucho esto)
+  #define SUELO_NREG      8      // registros 0x0000-0x0007 (reg7 = indicador de acidez)
 #endif
 
 // ---------- ACTUADORES ----------
@@ -172,7 +196,7 @@ uint8_t dhtFallas = DHT_FALLAS_MAX;
 float humSuelo = 0;
 int   aire = 0, co = 0;
 bool  hayAgua = true, presencia = false;
-float sTemp = 0, sPH = 0;
+float sTemp = 0, sPH = 0;          // sPH = reg7/10: indicador de acidez APROXIMADO, no pH real
 uint16_t sEC = 0, sN = 0, sP = 0, sK = 0;
 bool  sueloOK = false;
 bool  gasActivo = false;           // alarma de gases enclavada (con histeresis)
@@ -390,12 +414,35 @@ void aplicarSalidas() {
   digitalWrite(PIN_LUZ,    salida[A_ALARMA] ? HIGH : LOW);
 }
 
-// ---------- APTITUD DEL SUELO (por ahora solo pH, Q-23) ----------
+// ---------- APTITUD DEL SUELO (DEMO) ----------
+// Peor de tres senales: EC, humedad de suelo e indicador de acidez (reg7/10, sin calibrar).
+//   0 = APTO   1 = REGULAR   2 = NO_APTO
+#if USA_7EN1
+uint8_t nivelEC() {
+  if (sEC >= EC_APTO_MIN && sEC <= EC_APTO_MAX) return 0;
+  if (sEC >  EC_APTO_MAX && sEC <= EC_REG_MAX)  return 1;
+  return 2;                                          // < 100 (agua/vinagre/aire) o > 4000 (muy salino)
+}
+uint8_t nivelHumedad() {
+  if (humSuelo >= HUM_APTO_MIN && humSuelo <= HUM_APTO_MAX) return 0;
+  if (humSuelo >= HUM_REG_MIN  && humSuelo <= HUM_REG_MAX)  return 1;
+  return 2;
+}
+uint8_t nivelAcidez() {
+  if (sPH >= ACID_APTO_MIN) return 0;
+  if (sPH >= ACID_REG_MIN)  return 1;
+  return 2;                                          // acidez fuerte (ej. vinagre = 4.0)
+}
+#endif
+
 const char* aptitudCodigo() {
   #if USA_7EN1
     if (!sueloOK) return "SIN_LECTURA";
-    if (sPH >= PH_APTO_MIN && sPH <= PH_APTO_MAX) return "APTO";
-    if (sPH >= PH_REG_MIN  && sPH <= PH_REG_MAX)  return "REGULAR";
+    uint8_t peor = nivelEC();
+    uint8_t n = nivelHumedad(); if (n > peor) peor = n;
+    n = nivelAcidez();          if (n > peor) peor = n;
+    if (peor == 0) return "APTO";
+    if (peor == 1) return "REGULAR";
     return "NO_APTO";
   #else
     return "SIN_LECTURA";
@@ -443,7 +490,7 @@ void mostrarLCD() {
       lcd.setCursor(0,1); lcd.print("Hum:"); lcd.print(humSuelo,0); lcd.print("%"); if (!sueloOK) lcd.print(" sin dato");
       break;
     case 2:
-      lcd.setCursor(0,0); lcd.print("pH:"); lcd.print(sPH,1); lcd.print(" EC:"); lcd.print(sEC);
+      lcd.setCursor(0,0); lcd.print("pH~"); lcd.print(sPH,1); lcd.print(" EC:"); lcd.print(sEC);   // "~" = aproximado, sin calibrar
       lcd.setCursor(0,1); lcd.print("N"); lcd.print(sN); lcd.print(" P"); lcd.print(sP); lcd.print(" K"); lcd.print(sK);
       break;
     case 3:
@@ -515,7 +562,7 @@ void publicarJSON() {
   jInt  ("suelo_h", (long)constrain(humSuelo, 0, 100));
   #if USA_7EN1
     jFloat("suelo_t", constrain(sTemp, -40, 80), 1);
-    jFloat("ph",      constrain(sPH, 0, 14), 1);
+    jFloat("ph",      constrain(sPH, 0, 14), 1);   // OJO: es reg7/10, indicador aproximado SIN CALIBRAR (la web lo rotula "pH aprox.")
     jInt  ("ec",      sEC);
     jInt  ("n",       sN);
     jInt  ("p",       sP);
@@ -706,11 +753,14 @@ uint8_t procesar(char** tok, uint8_t n, char* eco) {
 
 // ---------- SENSOR 7-EN-1 (RS485 / Modbus) ----------
 //   reg0 = temperatura /10   reg1 = humedad /10   reg2 = EC (us/cm)
-//   reg3 = pH /10            reg4 = N   reg5 = P   reg6 = K  (mg/kg)
+//   reg3 = pH /10 (SIEMPRE 0 en este sensor: electrodo sin respuesta)
+//   reg4 = N   reg5 = P   reg6 = K  (mg/kg)
+//   reg7 = indicador de acidez /10 (tierra/agua ~6.2-6.4, vinagre ~4.0).
+//          Sin calibrar; se manda en "ph" como valor APROXIMADO.
 // Lectura propia en vez de ModbusMaster: el MAX485 mete un byte basura
 // (FC, FE, F8...) antes de la respuesta, y ModbusMaster la descartaba
 // completa por "direccion invalida". Aqui se busca la trama valida
-// (02 03 0E + 14 datos + CRC) dentro de lo recibido.
+// (02 03 10 + 16 datos + CRC) dentro de lo recibido.
 #if USA_7EN1
 uint16_t crcModbus(const uint8_t* b, uint8_t n) {
   uint16_t crc = 0xFFFF;
@@ -721,7 +771,7 @@ uint16_t crcModbus(const uint8_t* b, uint8_t n) {
   return crc;
 }
 void leer7en1() {
-  uint8_t req[8] = { SUELO_ADDR, 0x03, 0x00, 0x00, 0x00, 0x07, 0, 0 };
+  uint8_t req[8] = { SUELO_ADDR, 0x03, 0x00, 0x00, 0x00, SUELO_NREG, 0, 0 };
   uint16_t c = crcModbus(req, 6);
   req[6] = c & 0xFF; req[7] = c >> 8;
 
@@ -733,24 +783,25 @@ void leer7en1() {
   delayMicroseconds(50);
   digitalWrite(RS485_DIR, LOW);                     // recibir
 
-  const uint8_t LARGO = 19;                         // 3 cabecera + 14 datos + 2 CRC
+  const uint8_t NDATOS = SUELO_NREG * 2;            // 16 bytes de datos
+  const uint8_t LARGO  = 3 + NDATOS + 2;            // 3 cabecera + 16 datos + 2 CRC = 21
   uint8_t buf[40]; uint8_t n = 0;
   unsigned long t0 = millis();
   while (millis() - t0 < SUELO_TIMEOUT_MS) {
     while (Serial2.available() && n < sizeof(buf)) buf[n++] = Serial2.read();
     for (uint8_t s = 0; s + LARGO <= n; s++) {      // salta bytes basura al inicio
       const uint8_t* f = buf + s;
-      if (f[0] != SUELO_ADDR || f[1] != 0x03 || f[2] != 14) continue;
+      if (f[0] != SUELO_ADDR || f[1] != 0x03 || f[2] != NDATOS) continue;
       if (crcModbus(f, LARGO - 2) != (uint16_t)(f[LARGO - 2] | (f[LARGO - 1] << 8))) continue;
-      uint16_t r[7];
-      for (uint8_t i = 0; i < 7; i++) r[i] = (f[3 + 2 * i] << 8) | f[4 + 2 * i];
+      uint16_t r[SUELO_NREG];
+      for (uint8_t i = 0; i < SUELO_NREG; i++) r[i] = (f[3 + 2 * i] << 8) | f[4 + 2 * i];
       sTemp    = r[0] / 10.0;
       humSuelo = r[1] / 10.0;
       sEC      = r[2];
-      sPH      = r[3] / 10.0;
       sN       = r[4];
       sP       = r[5];
       sK       = r[6];
+      sPH      = r[7] / 10.0;                       // indicador de acidez aproximado (reg3 siempre es 0)
       sueloOK  = true;
       return;
     }
